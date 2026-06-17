@@ -276,13 +276,13 @@ class TroopBehaviour(CyclicBehaviour):
             await asyncio.sleep(0.1)
             return
             
-        if troop.wait_time is not None:
+        if troop.wait_time >= game_time:
             if game_time < troop.wait_time:
                 troop.rest()
                 await asyncio.sleep(0.1)
                 return
             else:
-                troop.wait_time = None  # Time elapsed, resume normal behavior
+                troop.wait_time = 0  # Time elapsed, resume normal behavior
                 
         # Detect enemies
         troop.detect_enemies(self.agent.all_troops)
@@ -795,8 +795,8 @@ async def main():
         troop(110, 120, name="Cyanne", squad="B00", team="blue", color=(0, 100, 205), weapons=[weapon("Bow", 8, 4, 10, 100, "arrows")], ammo={"arrows": 20}),
         troop(125, 115, name="Dave Azure", squad="B01", team="blue", color=(0, 50, 255), weapons=[weapon("Shotgun", 15, 2, 7, 100, "shells")], ammo={"shells": 10}),
         troop(115, 125, name="Eve Navy", squad="B1", team="blue", color=(0, 0, 200), weapons=[weapon("Sniper", 20, 10, 40, 100, "bullets")], ammo={"bullets": 5}),
-        troop(120, 120, name="Frank", squad="B10", team="blue", color=(0, 0, 180), weapons=[weapon("SMG", 7, 4, 8, 100, "bullets")], ammo={"bullets": 50})
-    ]
+        troop(120, 120, name="Frank", squad="B10", team="blue", color=(0, 0, 180), weapons=[weapon("SMG", 7, 4, 8, 100, "bullets")], ammo={"bullets": 50}),
+        ]
     
     troops= red_troops + blue_troops
     
