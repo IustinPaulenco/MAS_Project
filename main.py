@@ -6,6 +6,7 @@ import json
 import os
 import asyncio
 import time
+import spade
 from spade.agent import Agent
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 from spade.message import Message
@@ -108,47 +109,78 @@ class TroopBehaviour(CyclicBehaviour):
         super().__init__()
         self.mode = mode
     
-    async def on_start(self):
-        """Called when behaviour starts."""
-        pass
-    
-    async def on_end(self):
-        """Called when behaviour ends."""
-        pass
-    
     async def run(self):
         """Entry point for SPADE CyclicBehaviour."""
         await self.action()
     
     async def action(self):
-        """Main decision-making logic. Override in subclasses."""
+        """Main decision-making logic."""
+        global game_time
         troop = self.agent.troop
-        # Process incoming SPADE-style messages in agent inbox (if any)
-        if hasattr(self.agent, 'inbox') and self.agent.inbox:
-            while self.agent.inbox:
-                msg = self.agent.inbox.pop(0)
+        
+        # Dead troop logic: stay connected to prevent crashes, but refuse orders.
+        if troop.health <= 0:
+            troop.color = (100, 100, 100)  # Turn gray to indicate death
+            msg = await self.receive(timeout=0.1)
+            if msg:
                 try:
                     payload = json.loads(msg.body)
+                    if payload.get('type') in ('order', 'discovery'):
+                        leader_info = payload.get('leader')
+                        if leader_info and 'name' in leader_info:
+                            leader_name = leader_info['name']
+                            refusal_msg = Message(to=f"{leader_name.replace(' ', '').lower()}@localhost")
+                            refusal_msg.body = json.dumps({
+                                'type': 'refusal',
+                                'from': troop.name,
+                                'command': payload.get('command'),
+                                'reason': 'KIA'
+                            })
+                            await self.send(refusal_msg)
                 except Exception:
-                    payload = {}
-                # expected payload: { 'type': 'order', 'leader': {'name':..., 'squad':..., 'x':..., 'y':...}, 'command': 'delete'|'go_to', 'args': {...} }
+                    pass
+            await asyncio.sleep(0.1)
+            return
+            
+        # Process incoming SPADE messages
+        msg = await self.receive(timeout=0.1)
+        if msg:
+            try:
+                payload = json.loads(msg.body)
                 if payload.get('type') == 'order':
                     leader_info = payload.get('leader')
                     command = payload.get('command')
                     args = payload.get('args')
                     acknowledged = troop.respond_to_order(leader_info, command, args)
-                    # send ack back to leader if requested
                     if acknowledged and leader_info:
-                        leader_name = leader_info.get('name') if isinstance(leader_info, dict) else getattr(leader_info, 'name', None)
+                        leader_name = leader_info.get('name')
                         if leader_name:
-                            leader_troop = name_to_troop.get(leader_name)
-                            if leader_troop:
-                                ack_msg = Message()
-                                ack_msg.body = json.dumps({'type':'ack','from':troop.name,'command':command})
-                                # send via decider map if available
-                                if hasattr(self.agent, 'send_spade_message') and leader_troop in decider_map:
-                                    self.agent.send_spade_message(leader_troop, ack_msg)
+                            ack_msg = Message(to=f"{leader_name.replace(' ', '').lower()}@localhost")
+                            ack_msg.body = json.dumps({'type':'ack','from':troop.name,'command':command})
+                            await self.send(ack_msg)
+                elif payload.get('type') == 'discovery':
+                    print(f"{troop.name}: Yessir! (discovered by {payload.get('leader', {}).get('name')})")
+                elif payload.get('type') == 'ack':
+                    print(f"[SPADE] {troop.name} received ACK from {payload.get('from')} for {payload.get('command')}")
+                elif payload.get('type') == 'refusal':
+                    print(f"[SPADE] {troop.name} received REFUSAL from {payload.get('from')} for {payload.get('command')}: {payload.get('reason')}")
+            except Exception:
+                pass
         
+        # --- Wait commands state overrides ---
+        if troop.waiting_for_signal:
+            troop.rest()
+            await asyncio.sleep(0.1)
+            return
+            
+        if troop.wait_time is not None:
+            if game_time < troop.wait_time:
+                troop.rest()
+                await asyncio.sleep(0.1)
+                return
+            else:
+                troop.wait_time = None  # Time elapsed, resume normal behavior
+                
         # Detect enemies
         troop.detect_enemies(self.agent.all_troops)
         
@@ -160,7 +192,11 @@ class TroopBehaviour(CyclicBehaviour):
             troop.rest()
         # Follow path if one exists
         elif troop.planned_actions:
+            old_stamina = troop.stamina
             troop.follow_path()
+            # If stamina didn't decrease, they failed to move (did nothing)
+            if troop.stamina == old_stamina:
+                troop.rest()
         # Plan new path if idle
         else:
             await self.decide_idle(troop)
@@ -168,41 +204,100 @@ class TroopBehaviour(CyclicBehaviour):
         await asyncio.sleep(0.1)
     
     async def decide_combat(self, troop):
-        """Decide combat action. Override for different strategies."""
         troop.react(troop.detected_enemies[0])
     
     async def decide_idle(self, troop):
-        """Decide what to do when idle. Override for different strategies."""
-        if random.random() < 0.1:  # 10% chance to plan new path
+        if random.random() < 0.1:
             target_x = random.randint(0, len(map[0]) - 1)
             target_y = random.randint(0, len(map) - 1)
             troop.plan_path(target_x, target_y)
-        else:
-            troop.rest()
+            
+        # Always rest when in the idle state
+        troop.rest()
 
+class SquadLeaderBehaviour(TroopBehaviour):
+    async def action(self):
+        troop = self.agent.troop
+        
+        if troop.health > 0:
+            # Broadcast pending manual commands
+            while self.agent.commands_to_broadcast:
+                cmd, args = self.agent.commands_to_broadcast.pop(0)
+                await self.broadcast_and_command(cmd, args, self.agent.all_troops)
+                
+                if cmd == "wait_for_signal":
+                    # Automatically schedule a "now" command after a few seconds
+                    delay = args.get("delay", 5) if isinstance(args, dict) else 5
+                    
+                    async def send_now_later(delay_seconds):
+                        await asyncio.sleep(delay_seconds)
+                        if self.agent.troop.health > 0:
+                            print(f"[{self.agent.troop.name}] Wait timer expired! Auto-queueing 'now' command.")
+                            self.agent.commands_to_broadcast.append(("now", None))
+                            
+                    asyncio.create_task(send_now_later(delay))
+                
+            # 1% chance per tick to call squad nearby
+            if random.random() < 0.01:
+                await self.broadcast_and_command("go_to", {"x": troop.x, "y": troop.y}, self.agent.all_troops)
+                print(f"{troop.name} randomly calls the squad to rally at ({troop.x}, {troop.y})!")
+            
+        # Perform normal troop behaviour (includes processing inbox, moving, etc.)
+        await super().action()
 
-class TroopAgent(Agent):
-    """Base SPADE agent for individual troop units."""
-    
+    async def broadcast_and_command(self, command, args, all_troops):
+        troop = self.agent.troop
+        print(f"{troop.name} broadcasting to squad='{troop.squad}' at ({troop.x},{troop.y}) using SPADE")
+        responders = []
+        
+        for t in all_troops:
+            if t is not troop:
+                distance = abs(troop.x - t.x) + abs(troop.y - t.y)
+                if distance <= getattr(troop, 'view_range', 0) and t.squad.startswith(troop.squad):
+                    target_jid = f"{t.name.replace(' ', '').lower()}@localhost"
+                    
+                    discovery_msg = Message(to=target_jid)
+                    payload = {
+                        'type': 'discovery',
+                        'leader': {'name': troop.name, 'squad': troop.squad, 'x': troop.x, 'y': troop.y},
+                        'command': 'discover',
+                    }
+                    discovery_msg.body = json.dumps(payload)
+                    await self.send(discovery_msg)
+                    
+                    msg = Message(to=target_jid)
+                    payload = {
+                        'type': 'order',
+                        'leader': {'name': troop.name, 'squad': troop.squad, 'x': troop.x, 'y': troop.y},
+                        'command': command,
+                        'args': args,
+                    }
+                    msg.body = json.dumps(payload)
+                    await self.send(msg)
+                    responders.append(t.name)
+        
+        print(f"{troop.name} issued '{command}' to {len(responders)} troops via SPADE")
+
+class SquadLeaderAgent(Agent):
+    """Base SPADE agent, acts as a superclass for TroopAgent."""
     def __init__(self, jid, password, troop_instance, all_troops, mode="normal"):
         super().__init__(jid, password)
         self.troop = troop_instance
         self.all_troops = all_troops
         self.mode = mode
-        self.decision_behaviour = None
-    
+        self.commands_to_broadcast = []
+
     async def setup(self):
-        """Initialize agent and add behaviour."""
+        self.decision_behaviour = SquadLeaderBehaviour(mode=self.mode)
+        self.add_behaviour(self.decision_behaviour)
+        print(f"[AGENT] {self.name} (SquadLeader) started in mode {self.mode}")
+
+class TroopAgent(SquadLeaderAgent):
+    """SPADE agent for individual troop units, inheriting from SquadLeaderAgent."""
+    async def setup(self):
         self.decision_behaviour = TroopBehaviour(mode=self.mode)
         self.add_behaviour(self.decision_behaviour)
-        print(f"[AGENT] {self.name} started in mode {self.mode}")
-    
-    def set_mode(self, new_mode):
-        """Change the decision mode at runtime."""
-        self.mode = new_mode
-        if self.decision_behaviour:
-            self.decision_behaviour.mode = new_mode
-        print(f"[AGENT] {self.name} mode changed to {new_mode}")
+        print(f"[AGENT] {self.name} (Troop) started in mode {self.mode}")
 
 
 class weapon:
@@ -250,6 +345,8 @@ class troop:
         self.detected_enemies = detected_enemies if detected_enemies is not None else []
         self.rest_rate = -3  # Stamina points regenerated per rest action
         self.panic_timer = 0  # Timer to track how long the troop has been in panic mode, will use hp as stamina if enemies are detected
+        self.waiting_for_signal = False
+        self.wait_time = None
     
     def __str__(self):
         return f"Troop {self.name} at ({self.x}, {self.y}) with {self.health} health, {self.stamina} stamina"
@@ -379,8 +476,8 @@ class troop:
         else:
             leader_squad = getattr(leader, 'squad', None)
             leader_name = getattr(leader, 'name', None)
-        # Only respond if the leader's squad matches this troop's squad string
-        if leader_squad and (leader_squad in self.squad):
+        # Only respond if the leader's squad matches the start of this troop's squad string
+        if leader_squad and self.squad.startswith(leader_squad):
             # Different response based on command type
             if command == "discover":
                 print(f"{self.name}: Yessir! (discovered by {leader_name})")
@@ -389,6 +486,14 @@ class troop:
             # Execute the command locally if appropriate
             if command == "delete":
                 self.planned_actions.clear()
+            elif command == "wait_for_signal":
+                self.waiting_for_signal = True
+            elif command == "now":
+                self.waiting_for_signal = False
+                self.wait_time = None
+            elif command == "wait_until_time" and args is not None:
+                if isinstance(args, dict) and "time" in args:
+                    self.wait_time = args["time"]
             elif command == "go_to" and args is not None:
                 # args can be a tuple (x, y) or dict with 'x','y'
                 if isinstance(args, tuple) and len(args) >= 2:
@@ -438,280 +543,179 @@ class troop:
 class SquadLeader(troop):
     """Squad leader with ability to broadcast orders to nearby squad members."""
     def __init__(self, x, y, name="Leader", squad="", team="neutral", range=None, **kwargs):
-        # If caller supplied a 'range' value, map it to the existing 'view_range' field
         if range is not None:
             kwargs.setdefault('view_range', range)
         super().__init__(x, y, name=name, squad=squad, team=team, **kwargs)
-        # Track pending responses: {order_id: {'troops': set of troop names, 'timestamp': time, 'command': cmd}}
         self.pending_responses = {}
         self.order_counter = 0
 
     def broadcast_and_command(self, command, args, all_troops):
-        """Broadcasts presence and then issues a command to squad members in range.
-        Sequence: announce discovery (Yessir!) -> issue command (Roger!).
-        """
-        print(f"{self.name} broadcasting to squad='{self.squad}' at ({self.x},{self.y}) using leader's view_range={self.view_range}")
-        responders = []
-        order_id = self.order_counter
-        self.order_counter += 1
-        
-        for t in all_troops:
-            if t is not self:
-                distance = abs(self.x - t.x) + abs(self.y - t.y)
-                # Use the squad leader's view_range to decide recipients
-                if distance <= getattr(self, 'view_range', 0) and (self.squad in t.squad):
-                    # First: send discovery message (troops respond "Yessir!")
-                    discovery_msg = Message()
-                    payload = {
-                        'type': 'discovery',
-                        'leader': {'name': self.name, 'squad': self.squad, 'x': self.x, 'y': self.y},
-                        'command': 'discover',
-                    }
-                    discovery_msg.body = json.dumps(payload)
-                    if t in decider_map:
-                        decider_map[t].inbox.append(discovery_msg)
-                    
-                    # Second: send command message (troops respond "Roger!")
-                    msg = Message()
-                    payload = {
-                        'type': 'order',
-                        'leader': {'name': self.name, 'squad': self.squad, 'x': self.x, 'y': self.y},
-                        'command': command,
-                        'args': args,
-                    }
-                    msg.body = json.dumps(payload)
-                    # send via decider inbox if available
-                    if t in decider_map:
-                        decider_map[t].inbox.append(msg)
-                        responders.append(t.name)
-                        # Track pending Roger response from this troop
-                        if t in decider_map:
-                            decider_map[t].pending_orders[self.name] = {'timestamp': time.time(), 'command': command}
-                    else:
-                        # fallback: direct call
-                        ack = t.respond_to_order(self, command, args)
-                        if ack:
-                            responders.append(t)
-        
-        # Track pending responses
-        self.pending_responses[order_id] = {
-            'troops': set(responders),
-            'timestamp': time.time(),
-            'command': command
-        }
-        print(f"{self.name} issued '{command}' to {len(responders)} troops")
+        """Pass the command to the SPADE agent to broadcast."""
+        if hasattr(self, 'agent') and self.agent is not None:
+            self.agent.commands_to_broadcast.append((command, args))
+            print(f"{self.name} queued command '{command}' to SPADE agent.")
+        else:
+            print(f"[ERROR] {self.name} has no SPADE agent attached to send commands!")
     
     def check_roger_timeout(self, timeout_seconds=10):
-        """Check for troops that haven't sent Roger! within timeout."""
-        current_time = time.time()
-        timed_out = []
-        for order_id, resp_info in list(self.pending_responses.items()):
-            elapsed = current_time - resp_info['timestamp']
-            if elapsed > timeout_seconds:
-                timed_out.append((order_id, resp_info['troops'], resp_info['command'], elapsed))
-        for order_id, troop_names, command, elapsed in timed_out:
-            for troop_name in troop_names:
-                print(f"[TIMEOUT] {self.name}: No Roger! from {troop_name} for {command} after {elapsed:.1f}s")
-            del self.pending_responses[order_id]
+        # Delegate timeouts to SPADE agents, empty for now
+        pass
 
-# Screen settings
-WIDTH, HEIGHT = 800, 600
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Simulator")
-
-# Clock for controlling frame rate
-clock = pygame.time.Clock()
- 
-running = True
-
-game_time = 0
-game_cam_zoom = 1.0
-game_cam_x = 0
-game_cam_y = 0 
-
-red_leader = SquadLeader(28, 28, name="RedLeader", squad="R", team="red", color=(155, 0, 0),range=30)
-blue_leader = SquadLeader(118, 118, name="BlueLeader", squad="B", team="blue", color=(0, 0, 155),range=30)
-
-
-red_troops = [
-    troop(5, 5, name="John Doe", squad="R", team="red", color=(255, 0, 0), weapons=[weapon("Rifle", 10, 5, 15, 100, "bullets")], ammo={"bullets": 30}),
-    troop(0, 10, name="Jane Smith", squad="R0", team="red", color=(200, 0, 0), weapons=[weapon("Pistol", 5, 3, 6, 100, "bullets")], ammo={"bullets": 15}), 
-    troop(5, 15, name="Reddington Stone", squad="R00", team="red", color=(255, 55, 0), weapons=[weapon("Bow", 8, 4, 10, 100, "arrows")], ammo={"arrows": 20}),
-    troop(0, 20, name="Sam Johns", squad="R01", team="red", color=(180, 30, 0), weapons=[weapon("Shotgun", 15, 2, 7, 100, "shells")], ammo={"shells": 10}), 
-    troop(5, 25, name="Major Major", squad="R1", team="red", color=(200, 70, 255), weapons=[weapon("Sniper", 20, 10, 40, 100, "bullets")], ammo={"bullets": 5}),
-    troop(0, 30, name="Rob", squad="R10", team="red", color=(200, 10, 15), weapons=[weapon("SMG", 7, 4, 8, 100, "bullets")], ammo={"bullets": 50})
-]
-
-blue_troops = [
-    troop(115, 115, name="Alice Blue", squad="B", team="blue", color=(0, 0, 255), weapons=[weapon("Rifle", 10, 5, 15, 100, "bullets")], ammo={"bullets": 30}),
-    troop(120, 110, name="Bob Cyan", squad="B0", team="blue", color=(0, 100, 255), weapons=[weapon("Pistol", 5, 3, 6, 100, "bullets")], ammo={"bullets": 15}),
-    troop(110, 120, name="Cyanne", squad="B00", team="blue", color=(0, 100, 205), weapons=[weapon("Bow", 8, 4, 10, 100, "arrows")], ammo={"arrows": 20}),
-    troop(125, 115, name="Dave Azure", squad="B01", team="blue", color=(0, 50, 255), weapons=[weapon("Shotgun", 15, 2, 7, 100, "shells")], ammo={"shells": 10}),
-    troop(115, 125, name="Eve Navy", squad="B1", team="blue", color=(0, 0, 200), weapons=[weapon("Sniper", 20, 10, 40, 100, "bullets")], ammo={"bullets": 5}),
-    troop(120, 120, name="Frank", squad="B10", team="blue", color=(0, 0, 180), weapons=[weapon("SMG", 7, 4, 8, 100, "bullets")], ammo={"bullets": 50})
-]
-
-troops= red_troops + blue_troops
-
-
-troops.append(red_leader)
-troops.append(blue_leader)
-
-agents = []
-agent_tasks = []
-
-# Pre-render the map surface
-cached_map_surface = create_map_surface()
-
-# Instead of using actual SPADE agents with XMPP, we'll use lightweight decision objects
-class SimpleTroopDecider:
-    """Lightweight alternative to SPADE agents for single-process simulation."""
-    def __init__(self, troop_instance, all_troops, mode="normal"):
-        self.troop = troop_instance
-        self.all_troops = all_troops
-        self.mode = mode
-        self.behaviour_instance = TroopBehaviour(mode=mode)
-        # Manually set the agent reference (normally done by SPADE)
-        self.behaviour_instance.agent = self
-        # simple in-process inbox to simulate SPADE messages
-        self.inbox = []
-        # Track pending orders with timestamps for timeout detection
-        self.pending_orders = {}  # {leader_name: {'timestamp': time, 'command': cmd}}
-
-    def send_spade_message(self, target_troop, message):
-        """Simulate sending a SPADE Message to another troop's decider inbox."""
-        if target_troop in decider_map:
-            decider_map[target_troop].inbox.append(message)
-    
-    def check_order_timeout(self, timeout_seconds=10):
-        """Check for orders that timed out waiting for confirmation."""
-        current_time = time.time()
-        timed_out = []
-        for leader_name, order_info in self.pending_orders.items():
-            elapsed = current_time - order_info['timestamp']
-            if elapsed > timeout_seconds:
-                timed_out.append((leader_name, order_info['command'], elapsed))
-        for leader_name, command, elapsed in timed_out:
-            print(f"[TIMEOUT] {self.troop.name}: No confirmation for {command} from {leader_name} after {elapsed:.1f}s")
-            del self.pending_orders[leader_name]
-    
-    async def decide(self):
-        """Execute decision logic."""
-        self.check_order_timeout()
-        await self.behaviour_instance.action()
-    
-    def set_mode(self, new_mode):
-        """Change the decision mode."""
-        self.mode = new_mode
-        self.behaviour_instance.mode = new_mode
-        print(f"[DECIDER] {self.troop.name} mode changed to {new_mode}")
-
-
-# Create deciders for each troop
-deciders = []
-decider_map = {}
 name_to_troop = {}
+agents = []
+game_time = 0
 
-# Assign modes to troops by index (defaults to 'normal')
-mode_assignments = {
-    0: "normal",
-    1: "normal",
-    2: "normal",
-    3: "normal",
-    4: "normal",
-    5: "normal",
-    6: "normal",
-    7: "normal",
-    8: "normal",
-    9: "normal",
-    10: "normal",
-    11: "normal",
-    12: "normal",
-}
-for idx, t in enumerate(troops):
-    mode = mode_assignments.get(idx, "normal")
-    decider = SimpleTroopDecider(t, troops, mode)
-    deciders.append(decider)
-    decider_map[t] = decider
-    name_to_troop[t.name] = t
-
-while running:
-    # Handle events
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_EQUALS:  # Zoom in
-                # Get center of screen in world coordinates
-                center_world_x = (WIDTH / 2 + game_cam_x) / (20 * game_cam_zoom)
-                center_world_y = (HEIGHT / 2 + game_cam_y) / (20 * game_cam_zoom)
-                # Apply zoom
-                game_cam_zoom *= 1.1
-                # Adjust camera to keep center point at center of screen
-                game_cam_x = center_world_x * (20 * game_cam_zoom) - WIDTH / 2
-                game_cam_y = center_world_y * (20 * game_cam_zoom) - HEIGHT / 2
-            if event.key == pygame.K_MINUS:  # Zoom out
-                # Get center of screen in world coordinates
-                center_world_x = (WIDTH / 2 + game_cam_x) / (20 * game_cam_zoom)
-                center_world_y = (HEIGHT / 2 + game_cam_y) / (20 * game_cam_zoom)
-                # Apply zoom
-                game_cam_zoom /= 1.1
-                # Adjust camera to keep center point at center of screen
-                game_cam_x = center_world_x * (20 * game_cam_zoom) - WIDTH / 2
-                game_cam_y = center_world_y * (20 * game_cam_zoom) - HEIGHT / 2
+async def main():
+    global agents, name_to_troop, game_time
+    # Screen settings
+    WIDTH, HEIGHT = 800, 600
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Simulator")
     
-    # Handle continuous key presses for panning
-    keys = pygame.key.get_pressed()
-    pan_speed = 10
-    if keys[pygame.K_UP]:
-        game_cam_y -= pan_speed
-    if keys[pygame.K_DOWN]:
-        game_cam_y += pan_speed
-    if keys[pygame.K_LEFT]:
-        game_cam_x -= pan_speed
-    if keys[pygame.K_RIGHT]:
-        game_cam_x += pan_speed
+    # Clock for controlling frame rate
+    clock = pygame.time.Clock()
+     
+    running = True
+    
+    game_cam_zoom = 1.0
+    game_cam_x = 0
+    game_cam_y = 0 
+    
+    red_leader = SquadLeader(28, 28, name="RedLeader", squad="R", team="red", color=(155, 0, 0),range=30)
+    blue_leader = SquadLeader(118, 118, name="BlueLeader", squad="B", team="blue", color=(0, 0, 155),range=30)
+    
+    red_general0 = SquadLeader(18, 28, name="RedGeneral0", squad="R0", team="red", color=(155, 25, 0),range=30)
+    blue_general0 = SquadLeader(128, 118, name="BlueGeneral0", squad="B0", team="blue", color=(0, 25, 155),range=30)
+    
+    red_general1 = SquadLeader(28, 18, name="RedGeneral1", squad="R1", team="red", color=(155, 0, 25),range=30)
+    blue_general1 = SquadLeader(118, 128, name="BlueGeneral1", squad="B1", team="blue", color=(25, 0, 155),range=30)
     
     
-    # Update troops with agent-based decisions
-    if game_time % 15 == 0:  # Update 4 hz
-        # Check for timeouts on both leaders and troops
-        for decider in deciders:
-            decider.check_order_timeout()
+    red_troops = [
+        troop(5, 5, name="John Doe", squad="R", team="red", color=(255, 0, 0), weapons=[weapon("Rifle", 10, 5, 15, 100, "bullets")], ammo={"bullets": 30}),
+        troop(0, 10, name="Jane Smith", squad="R0", team="red", color=(200, 0, 0), weapons=[weapon("Pistol", 5, 3, 6, 100, "bullets")], ammo={"bullets": 15}), 
+        troop(5, 15, name="Reddington Stone", squad="R00", team="red", color=(255, 55, 0), weapons=[weapon("Bow", 8, 4, 10, 100, "arrows")], ammo={"arrows": 20}),
+        troop(0, 20, name="Sam Johns", squad="R01", team="red", color=(180, 30, 0), weapons=[weapon("Shotgun", 15, 2, 7, 100, "shells")], ammo={"shells": 10}), 
+        troop(5, 25, name="Major Major", squad="R1", team="red", color=(200, 70, 255), weapons=[weapon("Sniper", 20, 10, 40, 100, "bullets")], ammo={"bullets": 5}),
+        troop(0, 30, name="Rob", squad="R10", team="red", color=(200, 10, 15), weapons=[weapon("SMG", 7, 4, 8, 100, "bullets")], ammo={"bullets": 50})
+    ]
+    
+    blue_troops = [
+        troop(115, 115, name="Alice Blue", squad="B", team="blue", color=(0, 0, 255), weapons=[weapon("Rifle", 10, 5, 15, 100, "bullets")], ammo={"bullets": 30}),
+        troop(120, 110, name="Bob Cyan", squad="B0", team="blue", color=(0, 100, 255), weapons=[weapon("Pistol", 5, 3, 6, 100, "bullets")], ammo={"bullets": 15}),
+        troop(110, 120, name="Cyanne", squad="B00", team="blue", color=(0, 100, 205), weapons=[weapon("Bow", 8, 4, 10, 100, "arrows")], ammo={"arrows": 20}),
+        troop(125, 115, name="Dave Azure", squad="B01", team="blue", color=(0, 50, 255), weapons=[weapon("Shotgun", 15, 2, 7, 100, "shells")], ammo={"shells": 10}),
+        troop(115, 125, name="Eve Navy", squad="B1", team="blue", color=(0, 0, 200), weapons=[weapon("Sniper", 20, 10, 40, 100, "bullets")], ammo={"bullets": 5}),
+        troop(120, 120, name="Frank", squad="B10", team="blue", color=(0, 0, 180), weapons=[weapon("SMG", 7, 4, 8, 100, "bullets")], ammo={"bullets": 50})
+    ]
+    
+    troops= red_troops + blue_troops
+    
+    
+    troops.append(red_leader)
+    troops.append(blue_leader)
+    
+    agents.clear()
+    name_to_troop.clear()
+    
+    # Pre-render the map surface
+    cached_map_surface = create_map_surface()
+    
+    # Assign modes to troops by index (defaults to 'normal')
+    mode_assignments = {
+        i: "normal" for i in range(20)
+    }
+    
+    # Real SPADE initialization
+    for idx, t in enumerate(troops):
+        mode = mode_assignments.get(idx, "normal")
+        # Provide a simple JID based on troop name.
+        jid = f"{t.name.replace(' ', '').lower()}@localhost"
+        password = "password"
+        
+        if isinstance(t, SquadLeader):
+            agent = SquadLeaderAgent(jid, password, t, troops, mode)
+        else:
+            agent = TroopAgent(jid, password, t, troops, mode)
+            
+        t.agent = agent
+        agents.append(agent)
+        name_to_troop[t.name] = t
+    
+    async def start_spade_agents():
+        print("Starting all SPADE agents...")
+        for agent in agents:
+            try:
+                await agent.start(auto_register=True)
+            except Exception as e:
+                print(f"Failed to start agent {agent.jid}: {e}")
+    
+    # Start agents
+    await start_spade_agents()
+    
+    while running:
+        # Handle events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_EQUALS:  # Zoom in
+                    # Get center of screen in world coordinates
+                    center_world_x = (WIDTH / 2 + game_cam_x) / (20 * game_cam_zoom)
+                    center_world_y = (HEIGHT / 2 + game_cam_y) / (20 * game_cam_zoom)
+                    # Apply zoom
+                    game_cam_zoom *= 1.1
+                    # Adjust camera to keep center point at center of screen
+                    game_cam_x = center_world_x * (20 * game_cam_zoom) - WIDTH / 2
+                    game_cam_y = center_world_y * (20 * game_cam_zoom) - HEIGHT / 2
+                if event.key == pygame.K_MINUS:  # Zoom out
+                    # Get center of screen in world coordinates
+                    center_world_x = (WIDTH / 2 + game_cam_x) / (20 * game_cam_zoom)
+                    center_world_y = (HEIGHT / 2 + game_cam_y) / (20 * game_cam_zoom)
+                    # Apply zoom
+                    game_cam_zoom /= 1.1
+                    # Adjust camera to keep center point at center of screen
+                    game_cam_x = center_world_x * (20 * game_cam_zoom) - WIDTH / 2
+                    game_cam_y = center_world_y * (20 * game_cam_zoom) - HEIGHT / 2
+        
+        # Handle continuous key presses for panning
+        keys = pygame.key.get_pressed()
+        pan_speed = 10
+        if keys[pygame.K_UP]:
+            game_cam_y -= pan_speed
+        if keys[pygame.K_DOWN]:
+            game_cam_y += pan_speed
+        if keys[pygame.K_LEFT]:
+            game_cam_x -= pan_speed
+        if keys[pygame.K_RIGHT]:
+            game_cam_x += pan_speed
+        
+        
+        # Update troops with agent-based decisions
+        if game_time % 15 == 0:  # Update 4 hz
+            pass
+        
+        # Yield to asyncio event loop so SPADE can process messages
+        await asyncio.sleep(0.01)
+            
+        
+        # Draw
+        game_time += 1
+        screen.fill([0, 127+int(127*sin(game_time/3600)), 40+int(-40*sin(game_time/3600-180))])  # Fill the screen with background color
+        
+        # Draw the cached map
+        draw_map(screen, cached_map_surface, game_cam_x, game_cam_y, game_cam_zoom)
+        
+        # Draw troops
         for t in troops:
-            if isinstance(t, SquadLeader):
-                t.check_roger_timeout()
+            t.draw(screen, game_cam_x, game_cam_y, game_cam_zoom)
         
-        # Run all agent decisions concurrently
-        async def update_all_agents():
-            tasks = [decider.decide() for decider in deciders]
-            await asyncio.gather(*tasks)
-        
-        # Run the async update in a sync context
-        try:
-            asyncio.run(update_all_agents())
-        except RuntimeError as e:
-            # If event loop already running, use a different approach
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(update_all_agents())
-            loop.close()
-        
-    
-    # Draw
-    game_time += 1
-    screen.fill([0, 127+int(127*sin(game_time/3600)), 40+int(-40*sin(game_time/3600-180))])  # Fill the screen with background color
-    
-    # Draw the cached map
-    draw_map(screen, cached_map_surface, game_cam_x, game_cam_y, game_cam_zoom)
-    
-    # Draw troops
-    for troop in troops:
-        troop.draw(screen, game_cam_x, game_cam_y, game_cam_zoom)
-    
-    pygame.display.flip()
-    clock.tick(60)
- 
-pygame.quit()
-sys.exit()
+        pygame.display.flip()
+        clock.tick(60)
+     
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    spade.run(main(), embedded_xmpp_server=True)
  
