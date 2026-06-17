@@ -18,6 +18,8 @@ The commands are as follows:
 
 The commands are given in a queue by the leaders to syncronize their manpower.
 
+To prevent deadlocks, waiting troops periodically check if there are any leaders left nearby to decide if they should wait longer under their leaders command or abort waiting and return to normal behaviour.
+
 Each troop, in lack of commands from leadership will roam the map and try to survive, hitting enemies if they have enough hp, resting if they are tired, and running away to save their life if they have low hp and meet an enemy. Over-exhaustion deals damage to the troops and resting after regaining all stamina heals them. The leaders extend this troop idle behaviour. Leaders can also follow commands when given by someone with a higher grade than them.
 
 The terrain is loaded from the map.txt file.

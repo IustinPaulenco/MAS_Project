@@ -68,16 +68,53 @@ def create_map_surface():
     return map_surface
 
 def draw_map(surface, map_surface, cam_x, cam_y, cam_zoom):
-    """Draw the cached map surface with camera transform."""
+    """Draw the cached map surface with camera transform, culling out-of-range tiles."""
     tile_size = 20
-    scaled_width = int(map_surface.get_width() * cam_zoom)
-    scaled_height = int(map_surface.get_height() * cam_zoom)
     
-    # Scale the map surface
-    scaled_map = pygame.transform.scale(map_surface, (scaled_width, scaled_height))
+    # Determine the visible area in unscaled coordinates
+    unscaled_cam_x = cam_x / cam_zoom
+    unscaled_cam_y = cam_y / cam_zoom
+    unscaled_screen_w = surface.get_width() / cam_zoom
+    unscaled_screen_h = surface.get_height() / cam_zoom
     
-    # Draw at camera position
-    surface.blit(scaled_map, (-cam_x, -cam_y))
+    # Calculate tile ranges (culling invisible tiles)
+    start_tile_x = int(unscaled_cam_x // tile_size)
+    start_tile_y = int(unscaled_cam_y // tile_size)
+    end_tile_x = int((unscaled_cam_x + unscaled_screen_w) // tile_size) + 1
+    end_tile_y = int((unscaled_cam_y + unscaled_screen_h) // tile_size) + 1
+    
+    # Clamp to map boundaries
+    start_tile_x = max(0, start_tile_x)
+    start_tile_y = max(0, start_tile_y)
+    end_tile_x = min(len(map[0]), end_tile_x)
+    end_tile_y = min(len(map), end_tile_y)
+    
+    if start_tile_x >= end_tile_x or start_tile_y >= end_tile_y:
+        return
+        
+    # Crop the map surface to only the visible tiles
+    crop_x = start_tile_x * tile_size
+    crop_y = start_tile_y * tile_size
+    crop_w = (end_tile_x - start_tile_x) * tile_size
+    crop_h = (end_tile_y - start_tile_y) * tile_size
+    
+    visible_rect = pygame.Rect(crop_x, crop_y, crop_w, crop_h)
+    visible_map_part = map_surface.subsurface(visible_rect)
+    
+    # Scale only the visible part
+    scaled_width = int(crop_w * cam_zoom)
+    scaled_height = int(crop_h * cam_zoom)
+    
+    if scaled_width <= 0 or scaled_height <= 0:
+        return
+        
+    scaled_map = pygame.transform.scale(visible_map_part, (scaled_width, scaled_height))
+    
+    # Draw at the correct screen position
+    screen_x = (crop_x * cam_zoom) - cam_x
+    screen_y = (crop_y * cam_zoom) - cam_y
+    
+    surface.blit(scaled_map, (screen_x, screen_y))
 
 def draw_bar(surface, x, y, width, height, current_value, max_value, bg_color, fg_color):
     """Draw a status bar (HP, stamina, etc.)
@@ -142,12 +179,27 @@ class TroopBehaviour(CyclicBehaviour):
             await asyncio.sleep(0.1)
             return
             
-        # Process incoming SPADE messages
-        msg = await self.receive(timeout=0.1)
+        # Process incoming SPADE messages — one blocking receive, then drain extras
+        # Using a small positive timeout for the first receive is critical: timeout=0
+        # can cause the coroutine to never yield in some SPADE/pyjabber versions,
+        # permanently stalling the agent behaviour.
+        MAX_DRAIN = 20
+        msg = await self.receive(timeout=0.05)
+        msgs_to_process = []
         if msg:
+            msgs_to_process.append(msg)
+            # Drain any additional queued messages (non-blocking)
+            for _ in range(MAX_DRAIN):
+                extra = await self.receive(timeout=0)
+                if not extra:
+                    break
+                msgs_to_process.append(extra)
+
+        for msg in msgs_to_process:
             try:
                 payload = json.loads(msg.body)
-                if payload.get('type') == 'order':
+                msg_type = payload.get('type')
+                if msg_type == 'order':
                     leader_info = payload.get('leader')
                     command = payload.get('command')
                     args = payload.get('args')
@@ -158,18 +210,69 @@ class TroopBehaviour(CyclicBehaviour):
                             ack_msg = Message(to=f"{leader_name.replace(' ', '').lower()}@localhost")
                             ack_msg.body = json.dumps({'type':'ack','from':troop.name,'command':command})
                             await self.send(ack_msg)
-                elif payload.get('type') == 'discovery':
+                elif msg_type == 'discovery':
                     print(f"{troop.name}: Yessir! (discovered by {payload.get('leader', {}).get('name')})")
-                elif payload.get('type') == 'ack':
+                elif msg_type == 'ack':
                     print(f"[SPADE] {troop.name} received ACK from {payload.get('from')} for {payload.get('command')}")
-                elif payload.get('type') == 'refusal':
+                elif msg_type == 'refusal':
                     print(f"[SPADE] {troop.name} received REFUSAL from {payload.get('from')} for {payload.get('command')}: {payload.get('reason')}")
+                elif msg_type == 'ping_leader':
+                    # Only SquadLeaders respond to pings
+                    if isinstance(troop, SquadLeader) and troop.health > 0:
+                        from_x = payload.get('from_x', 0)
+                        from_y = payload.get('from_y', 0)
+                        from_team = payload.get('from_team')
+                        from_name = payload.get('from_name')
+                        distance = abs(troop.x - from_x) + abs(troop.y - from_y)
+                        # Respond only if same team and within this leader's view range
+                        if from_team == troop.team and distance <= troop.view_range:
+                            pong_msg = Message(to=f"{from_name.replace(' ', '').lower()}@localhost")
+                            pong_msg.body = json.dumps({
+                                'type': 'pong_leader',
+                                'from': troop.name,
+                                'leader_x': troop.x,
+                                'leader_y': troop.y,
+                            })
+                            await self.send(pong_msg)
+                elif msg_type == 'pong_leader':
+                    # Count leader responses
+                    troop.leaders_in_range_count += 1
             except Exception:
                 pass
         
+        # Send pending leader pings
+        if troop._leader_ping_pending:
+            troop._leader_ping_pending = False
+            troop.leaders_in_range_count = 0  # Reset count for new round
+            for t in self.agent.all_troops:
+                if isinstance(t, SquadLeader) and t is not troop and t.health > 0:
+                    ping_msg = Message(to=f"{t.name.replace(' ', '').lower()}@localhost")
+                    ping_msg.body = json.dumps({
+                        'type': 'ping_leader',
+                        'from_name': troop.name,
+                        'from_x': troop.x,
+                        'from_y': troop.y,
+                        'from_team': troop.team,
+                    })
+                    await self.send(ping_msg)
+        
         # --- Wait commands state overrides ---
         if troop.waiting_for_signal:
-            troop.rest()
+            if troop.panic_timer > 1:
+                troop.waiting_for_signal = False
+                print(f"{troop.name}: Panic overrides wait! Breaking free.")
+            else:
+                if troop.wait_time > game_time:
+                    troop.rest()
+                else:
+                    leaders_nearby = troop.find_leaders_in_range_count()
+                    if leaders_nearby:
+                        troop.rest()
+                        troop.wait_time = game_time + 100  # Re-check in ~100 ticks (~10s at 0.1s/tick)
+                    else:
+                        print(f"{troop.name}: No leader in range! Breaking wait.")
+                        troop.waiting_for_signal = False
+                        troop.wait_time = 0
             await asyncio.sleep(0.1)
             return
             
@@ -226,24 +329,41 @@ class SquadLeaderBehaviour(TroopBehaviour):
                 await self.broadcast_and_command(cmd, args, self.agent.all_troops)
                 
                 if cmd == "wait_for_signal":
-                    # Automatically schedule a "now" command after a few seconds
+                    # Leader also waits — directly set own state (no SPADE round-trip)
                     delay = args.get("delay", 5) if isinstance(args, dict) else 5
+                    delay_ticks = int(delay / 0.1)  # convert seconds to ~ticks (0.1s each)
+                    troop.wait_time = game_time + delay_ticks
+                    print(f"[{troop.name}] Also waiting with squad for {delay}s ({delay_ticks} ticks).")
                     
-                    async def send_now_later(delay_seconds):
+                    async def send_now_later(delay_seconds, leader=troop):
                         await asyncio.sleep(delay_seconds)
-                        if self.agent.troop.health > 0:
-                            print(f"[{self.agent.troop.name}] Wait timer expired! Auto-queueing 'now' command.")
+                        if leader.health > 0:
+                            print(f"[{leader.name}] Wait timer expired! Releasing self and squad.")
+                            # Release the leader directly
+                            leader.waiting_for_signal = False
+                            leader.wait_time = 0
+                            # Release the squad via SPADE
                             self.agent.commands_to_broadcast.append(("now", None))
                             
                     asyncio.create_task(send_now_later(delay))
                 
-            # 1% chance per tick to call squad nearby
-            if random.random() < 0.01:
-                await self.broadcast_and_command("go_to", {"x": troop.x, "y": troop.y}, self.agent.all_troops)
+                elif cmd == "now":
+                    # Also directly release the leader themselves
+                    troop.waiting_for_signal = False
+                    troop.wait_time = 0
+                
+            # Randomly issue commands
+            rand_val = random.random()
+            if rand_val < 0.01:
+                self.agent.commands_to_broadcast.append(("go_to", {"x": troop.x, "y": troop.y}))
                 print(f"{troop.name} randomly calls the squad to rally at ({troop.x}, {troop.y})!")
+            elif rand_val < 0.02:
+                self.agent.commands_to_broadcast.append(("wait_for_signal", {"delay": 5}))
+                print(f"{troop.name} randomly orders the squad to wait for 5 seconds!")
             
         # Perform normal troop behaviour (includes processing inbox, moving, etc.)
         await super().action()
+
 
     async def broadcast_and_command(self, command, args, all_troops):
         troop = self.agent.troop
@@ -346,7 +466,9 @@ class troop:
         self.rest_rate = -3  # Stamina points regenerated per rest action
         self.panic_timer = 0  # Timer to track how long the troop has been in panic mode, will use hp as stamina if enemies are detected
         self.waiting_for_signal = False
-        self.wait_time = None
+        self.wait_time = 0
+        self.leaders_in_range_count = 0  # Updated by SPADE pong responses
+        self._leader_ping_pending = False  # Flag to trigger leader ping broadcast
     
     def __str__(self):
         return f"Troop {self.name} at ({self.x}, {self.y}) with {self.health} health, {self.stamina} stamina"
@@ -464,6 +586,15 @@ class troop:
                 if distance <= self.view_range:
                     self.detected_enemies.append(troop)
         #print(f"{self} detected {len(self.detected_enemies)} enemies within view range.")
+    
+    def find_leaders_in_range_count(self):
+        """Trigger a SPADE ping to all leaders and return last known count.
+        
+        Sets a flag so the agent behaviour sends ping_leader messages on the
+        next tick. Returns the count from the previous ping round (pong_leader
+        responses already received). Converges after 1-2 ticks."""
+        self._leader_ping_pending = True
+        return self.leaders_in_range_count
     
     def respond_to_order(self, leader, command, args=None):
         """Default response to a squad leader's order. Returns True if acknowledged."""
@@ -677,6 +808,9 @@ async def main():
                     # Adjust camera to keep center point at center of screen
                     game_cam_x = center_world_x * (20 * game_cam_zoom) - WIDTH / 2
                     game_cam_y = center_world_y * (20 * game_cam_zoom) - HEIGHT / 2
+                if event.key == pygame.K_w:  # Issue wait order for red leader
+                    red_leader.broadcast_and_command("wait_for_signal", {"delay": 5}, troops)
+                    print("Manual Command: RedLeader orders WAIT")
         
         # Handle continuous key presses for panning
         keys = pygame.key.get_pressed()
