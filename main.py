@@ -421,7 +421,7 @@ class TroopAgent(SquadLeaderAgent):
 
 
 class weapon:
-    def __init__(self, name, damage, range, accuracy, durability, ammo_type, degrade_rate=0):
+    def __init__(self, name, damage, range, accuracy, durability, ammo_type, degrade_rate=0, image_path=None):
         self.name = name
         self.damage = damage
         self.range = range
@@ -429,6 +429,15 @@ class weapon:
         self.durability = durability
         self.ammo_type = ammo_type
         self.degrade_rate = degrade_rate
+        self.image_path = image_path
+        
+        self.image = None
+        if image_path:
+            try:
+                self.image = pygame.image.load(image_path).convert_alpha()
+            except Exception as e:
+                print(f"Failed to load weapon image '{image_path}': {e}")
+
     def attack(self, user, target):
         # Calculate hit chance based on accuracy
         if self.durability <= 0:
@@ -444,15 +453,29 @@ class weapon:
             self.durability -= self.degrade_rate
         else:
             print(f"{user} missed with {self.name}!")
+    
+    def draw(self,surface,x,y,zoom):
+        if self.image is None:
+            return
+
+        tile_size = int(20 * zoom)
+
+        img = pygame.transform.smoothscale(
+            self.image,
+            (tile_size, tile_size)
+        )
+
+        surface.blit(img, (x, y))
 
 class troop:
-    def __init__(self, x, y, name="Unnamed", squad="", team="neutral", color=(255, 0, 0), health=100, armor=0, stamina=100, speed=5, view_range=50, weapons=None, ammo=None, planned_actions=None, detected_enemies=None):
+    def __init__(self, x, y, name="Unnamed", squad="", team="neutral", color=(255, 0, 0), hat_path=None, health=100, armor=0, stamina=100, speed=5, view_range=50, weapons=None, ammo=None, planned_actions=None, detected_enemies=None):
         self.x = x
         self.y = y
         self.name = name
         self.squad = squad
         self.team = team
         self.color = color
+        self.hat=hat_path
         self.health = health
         self.armor = armor
         self.stamina = stamina
@@ -469,6 +492,15 @@ class troop:
         self.wait_time = 0
         self.leaders_in_range_count = 0  # Updated by SPADE pong responses
         self._leader_ping_pending = False  # Flag to trigger leader ping broadcast
+        
+        
+        self.hat = None
+
+        if hat_path:
+            try:
+                self.hat = pygame.image.load(hat_path).convert_alpha()
+            except Exception as e:
+                print(f"Failed to load hat image '{hat_path}': {e}")
     
     def __str__(self):
         return f"Troop {self.name} at ({self.x}, {self.y}) with {self.health} health, {self.stamina} stamina"
@@ -658,6 +690,32 @@ class troop:
         pygame.draw.rect(surface, color, (self.x * tile_size - cam_x, self.y * tile_size - cam_y, tile_size, tile_size))
         pygame.draw.rect(surface, (0, 0, 0), (self.x * tile_size - cam_x, self.y * tile_size - cam_y, tile_size, tile_size), 1)  # Black border for visibility
         
+
+        # Hat
+        if self.hat is not None:
+            hat_img = pygame.transform.smoothscale(
+                self.hat,
+                (int(tile_size*2), int(tile_size*2))
+            )
+
+            surface.blit(
+                hat_img,
+                ((self.x-0.5) * tile_size - cam_x, (self.y - 1) * tile_size - cam_y)
+            )
+
+        # Active weapon
+        if (
+            self.weapons and
+            0 <= self.active_slot < len(self.weapons) and
+            self.weapons[self.active_slot] is not None
+        ):
+            self.weapons[self.active_slot].draw(
+                surface,
+                self.x* tile_size-cam_x,
+                (self.y + 0.5) * tile_size - cam_y,
+                cam_zoom
+            )
+        
         # Bar dimensions
         bar_width = tile_size * 0.8
         bar_height = max(2, int(tile_size * 0.15))
@@ -712,14 +770,14 @@ async def main():
     game_cam_x = 0
     game_cam_y = 0 
     
-    red_leader = SquadLeader(28, 28, name="RedLeader", squad="R", team="red", color=(155, 0, 0),range=30)
-    blue_leader = SquadLeader(118, 118, name="BlueLeader", squad="B", team="blue", color=(0, 0, 155),range=30)
+    red_leader = SquadLeader(8, 8, name="RedLeader", squad="R", team="red", color=(155, 0, 0), hat_path="hat2.png", range=45)
+    blue_leader = SquadLeader(138, 138, name="BlueLeader", squad="B", team="blue", color=(0, 0, 155), hat_path="hat2.png", range=45)
     
-    red_general0 = SquadLeader(18, 28, name="RedGeneral0", squad="R0", team="red", color=(155, 25, 0),range=30)
-    blue_general0 = SquadLeader(128, 118, name="BlueGeneral0", squad="B0", team="blue", color=(0, 25, 155),range=30)
+    red_general0 = SquadLeader(18, 28, name="RedGeneral0", squad="R0", team="red", color=(155, 25, 0), hat_path="hat1.png", range=30)
+    blue_general0 = SquadLeader(128, 118, name="BlueGeneral0", squad="B0", team="blue", color=(0, 25, 155), hat_path="hat1.png", range=30)
     
-    red_general1 = SquadLeader(28, 18, name="RedGeneral1", squad="R1", team="red", color=(155, 0, 25),range=30)
-    blue_general1 = SquadLeader(118, 128, name="BlueGeneral1", squad="B1", team="blue", color=(25, 0, 155),range=30)
+    red_general1 = SquadLeader(28, 18, name="RedGeneral1", squad="R1", team="red", color=(155, 0, 25), hat_path="hat1.png", range=30)
+    blue_general1 = SquadLeader(118, 128, name="BlueGeneral1", squad="B1", team="blue", color=(25, 0, 155), hat_path="hat1.png", range=30)
     
     
     red_troops = [
@@ -745,6 +803,11 @@ async def main():
     
     troops.append(red_leader)
     troops.append(blue_leader)
+    
+    troops.append(red_general0)
+    troops.append(blue_general0)    
+    troops.append(red_general1)
+    troops.append(blue_general1)
     
     agents.clear()
     name_to_troop.clear()
