@@ -1,8 +1,9 @@
 # MAS Project
 pygame+spade Battle Simulator
 
-Simulates an automatic battle using Spade agents.
+Simulates an automatic battle using Spade agents. All agents have limited view distance and communication range.
 
+## Description
 
 This simulation features 2 armies fighting for control over a batallion. The point is for the leaders of the army to guide their soldiers to victory. For that, everyone on any team must collaborate
 
@@ -19,5 +20,9 @@ The commands are as follows:
 The commands are given in a queue by the leaders to syncronize their manpower.
 
 Each troop, in lack of commands from leadership will roam the map and try to survive, hitting enemies if they have enough hp, resting if they are tired, and running away to save their life if they have low hp and meet an enemy. Over-exhaustion deals damage to the troops and resting after regaining all stamina heals them. The leaders extend this troop idle behaviour. Leaders can also follow commands when given by someone with a higher grade than them.
+
+## Running
+
+To run the simulation, run the main.py file in Python 3.12.7. PyGame 2.6.1 and Spade 4.1.4 are necessary. 
 
 The terrain is loaded from the map.txt file.
